@@ -1,3 +1,22 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 /*!
  * Copyright (c) 2017 by Contributors
  * \file indexing_op-inl.cuh
@@ -8,6 +27,15 @@
 #define MXNET_OPERATOR_TENSOR_INDEXING_OP_CUH_
 #include <cub/device/device_run_length_encode.cuh>
 #include <cub/device/device_scan.cuh>
+#include "../mxnet_op.h"
+#include "../mshadow_op.h"
+#include "./util/tensor_util-inl.cuh"
+
+#if CUDA_VERSION >= 9000
+#define FULLMASK 0xFFFFFFFF
+#define __ballot(x) __ballot_sync(FULLMASK, (x))
+#define __all(x) __all_sync(FULLMASK, (x))
+#endif
 
 namespace mxnet {
 namespace op {
@@ -15,10 +43,10 @@ const int kWarpSize = 32;
 
 template<int SZ, typename DType, typename IdxType>
 __global__ void AddTakeGradLargeBatchKernel(DType* dst,
-                                           // If idx_start == NULL, then in-kernel edge
+                                           // If idx_start == nullptr, then in-kernel edge
                                            // detection is used
                                            const IdxType *idx_start,
-                                           // idx_start_size_ptr ignored if idx_start == NULL
+                                           // idx_start_size_ptr ignored if idx_start == nullptr
                                            const int* idx_start_size_ptr,
                                            const IdxType *sorted, const IdxType *index,
                                            const DType *src,
@@ -27,14 +55,14 @@ __global__ void AddTakeGradLargeBatchKernel(DType* dst,
   extern __shared__ char sh_grad_weight_char[];
   DType* sh_grad_weight = (DType*)sh_grad_weight_char;
 
-  int iidx_end = (idx_start == NULL) ? ymax : *idx_start_size_ptr;
+  int iidx_end = (idx_start == nullptr) ? ymax : *idx_start_size_ptr;
 
   for (int iidx = blockIdx.y;iidx < iidx_end;iidx += gridDim.y) {
 
     // Thread block sums up elements in the range [idx_begin, idx_end-1]
     int idx_begin, idx_end;
     int sorted_value;
-    if (idx_start == NULL) {
+    if (idx_start == nullptr) {
       idx_begin = iidx;
       sorted_value = static_cast<int>(sorted[idx_begin]);
       if (idx_begin > 0 && sorted_value == static_cast<int>(sorted[idx_begin - 1])) continue;
@@ -42,7 +70,7 @@ __global__ void AddTakeGradLargeBatchKernel(DType* dst,
       //   blockDim.x = 32
       //   blockDim.y = 4
       //   sorted[idx_begin:] = [4 4 4 9]
-      //   (3,4) denotes threadIdx.x=3, threadIdx.y=4, ":" is used for ranges 
+      //   (3,4) denotes threadIdx.x=3, threadIdx.y=4, ":" is used for ranges
       //   (0:31,0:3) sorted_value = 4
       idx_end = idx_begin + 1;
       unsigned int* sh_ballot = (unsigned int*)sh_grad_weight_char;
@@ -72,16 +100,14 @@ __global__ void AddTakeGradLargeBatchKernel(DType* dst,
       idx_end -= blockDim.x*blockDim.y;
       // Find the first edge
       // Example:
-      //   (0,:)  val = 1 << 0 = 1
+      //   (0,:)  val = 1
       //   (rest) val = 0
       unsigned int val = (threadIdx.x < blockDim.y && sh_ballot[threadIdx.x] != 0) ?
-        (1 << threadIdx.x) : 0;
-      // NOTE: We do butterfly reduction on the entire warp width
-      //       so that all threads have the same result
+        1 : 0;
+      // NOTE: Set nth bit if thread n in the warp has val = 1
       // Example:
       //   (all) val = 1
-      #pragma unroll
-      for (int i=warpSize/2;i>=1;i/=2) val |= __shfl_xor(val, i);
+      val = __ballot( val );
       // __ffs() returns the position of first set bit, 1...32. __ffs(1) = 1
       // j will be the warp index where edge was found
       // Example:
@@ -156,7 +182,7 @@ __global__ void AddTakeGradLargeBatchKernel(DType* dst,
         }
       }
     }
-  
+
   }
 }
 
@@ -165,11 +191,11 @@ inline typename std::enable_if<std::is_same<xpu, gpu>::value, size_t>::type
 AddTakeGradLargeBatchWorkspaceSize(size_t num_keys) {
   size_t encode_bytes = 0;
   cub::DeviceRunLengthEncode::Encode<IndexType*, IndexType*, IndexType*, int*>
-    (NULL, encode_bytes, NULL, NULL, NULL, NULL, num_keys);
+    (nullptr, encode_bytes, nullptr, nullptr, nullptr, nullptr, num_keys);
   size_t exclusivesum_bytes = 0;
-  cub::DeviceScan::ExclusiveSum<IndexType*, IndexType*>(NULL, exclusivesum_bytes,
-    NULL, NULL, num_keys);
-  size_t temporary_bytes = max(encode_bytes, exclusivesum_bytes);
+  cub::DeviceScan::ExclusiveSum<IndexType*, IndexType*>(nullptr, exclusivesum_bytes,
+    nullptr, nullptr, num_keys);
+  size_t temporary_bytes = std::max(encode_bytes, exclusivesum_bytes);
   size_t unique_bytes = num_keys*sizeof(IndexType);
   size_t counts_bytes = num_keys*sizeof(IndexType);
   size_t num_runs_bytes = 1*sizeof(int);
@@ -177,62 +203,20 @@ AddTakeGradLargeBatchWorkspaceSize(size_t num_keys) {
 }
 
 template<typename IndexType, typename DType>
-inline void AddTakeGradLargeBatch(mshadow::Tensor<gpu, 2, DType> dst,
-                                  const mshadow::Tensor<gpu, 1, IndexType>& sorted,
-                                  const mshadow::Tensor<gpu, 1, IndexType>& index,
-                                  const mshadow::Tensor<gpu, 2, DType> &src,
-                                  mshadow::Tensor<gpu, 1, char>* workspace) {
-  CHECK_EQ(dst.CheckContiguous(), true);
-  CHECK_EQ(sorted.CheckContiguous(), true);
-  CHECK_EQ(index.CheckContiguous(), true);
-  CHECK_EQ(src.CheckContiguous(), true);
-  // const int kWarpBits = kMemUnitBits;
+inline void AddTakeGradLargeBatchKernelLaunch(mshadow::Tensor<gpu, 2, DType> dst,
+                                              const mshadow::Tensor<gpu, 1, IndexType>& sorted,
+                                              const mshadow::Tensor<gpu, 1, IndexType>& index,
+                                              const mshadow::Tensor<gpu, 2, DType> &src,
+                                              IndexType* sum_counts_ptr,
+                                              int* num_runs_ptr,
+                                              const mshadow::index_t num_rows) {
   cudaStream_t stream = mshadow::Stream<gpu>::GetStream(dst.stream_);
-  IndexType* sum_counts_ptr = NULL;
-  int* num_runs_ptr = NULL;
-  if (dst.size(0)*4 < src.size(0) && workspace != NULL) {
-    // Workspace given and potentially loops at least 4 times, use CUB to create sum_counts
-    CHECK_EQ(workspace->CheckContiguous(), true);
-    // workspace = [unique_out, counts_out, temporary_storage]
-    size_t unique_bytes = sorted.size(0)*sizeof(IndexType);
-    size_t counts_bytes = sorted.size(0)*sizeof(IndexType);
-    size_t num_runs_bytes = 1*sizeof(int);
-
-    size_t encode_bytes = 0;
-    cub::DeviceRunLengthEncode::Encode<IndexType*, IndexType*, IndexType*, int*>
-      (NULL, encode_bytes, NULL, NULL, NULL, NULL, sorted.size(0), stream);
-    size_t exclusivesum_bytes = 0;
-    cub::DeviceScan::ExclusiveSum<IndexType*, IndexType*>
-      (NULL, exclusivesum_bytes, NULL, NULL, sorted.size(0), stream);
-    size_t temporary_bytes = max(encode_bytes, exclusivesum_bytes);
-
-    // Check that we have enough storage
-    CHECK_GE(workspace->size(0), unique_bytes + counts_bytes + 
-      num_runs_bytes + temporary_bytes);
-
-    IndexType* unique_out_ptr = reinterpret_cast<IndexType*>(workspace->dptr_);
-    IndexType* counts_out_ptr = reinterpret_cast<IndexType*>(workspace->dptr_ + unique_bytes);
-    num_runs_ptr = reinterpret_cast<int*>(workspace->dptr_ + unique_bytes +
-      counts_bytes);
-    void* temporary_storage = reinterpret_cast<void *>(workspace->dptr_ + unique_bytes + 
-      counts_bytes + num_runs_bytes);
-
-    cub::DeviceRunLengthEncode::Encode<IndexType*, IndexType*, IndexType*, int*>
-    (temporary_storage, temporary_bytes, sorted.dptr_, unique_out_ptr, counts_out_ptr,
-      num_runs_ptr, sorted.size(0), stream);
-
-    sum_counts_ptr = unique_out_ptr;
-    cub::DeviceScan::ExclusiveSum<IndexType*, IndexType*>
-    (temporary_storage, temporary_bytes, counts_out_ptr, sum_counts_ptr,
-      sorted.size(0), stream);
-  }
-
-  const int num_unique_est = min(dst.size(0), src.size(0));
+  const int num_unique_est = min(num_rows, src.size(0));
   const int max_nthread = 128;
-  const int num_y = max(src.size(0)/num_unique_est, 1);
+  const int num_y = max(static_cast<int>(src.size(0))/num_unique_est, 1);
   const int block_dim_x = kWarpSize;
   const int block_dim_y = min(num_y, max_nthread/block_dim_x);
-  const int SZ = min((src.size(1) + block_dim_x - 1) / block_dim_x, 4);
+  const int SZ = min((static_cast<int>(src.size(1)) + block_dim_x - 1) / block_dim_x, 4);
   const int grid_dim_x = (src.size(1) + block_dim_x * SZ - 1) / (block_dim_x * SZ);
   const int grid_dim_y = min(num_unique_est, mshadow::cuda::kBaseGridNum);
   dim3 dimBlock(block_dim_x, block_dim_y);
@@ -282,6 +266,61 @@ inline void AddTakeGradLargeBatch(mshadow::Tensor<gpu, 2, DType> dst,
     break;
   }
   MSHADOW_CUDA_POST_KERNEL_CHECK(AddTakeGradLargeBatchKernel);
+}
+
+
+template<typename IndexType, typename DType>
+inline void AddTakeGradLargeBatch(mshadow::Tensor<gpu, 2, DType> dst,
+                                  const mshadow::Tensor<gpu, 1, IndexType>& sorted,
+                                  const mshadow::Tensor<gpu, 1, IndexType>& index,
+                                  const mshadow::Tensor<gpu, 2, DType> &src,
+                                  mshadow::Tensor<gpu, 1, char>* workspace = nullptr) {
+  CHECK_EQ(dst.CheckContiguous(), true);
+  CHECK_EQ(sorted.CheckContiguous(), true);
+  CHECK_EQ(index.CheckContiguous(), true);
+  CHECK_EQ(src.CheckContiguous(), true);
+  // const int kWarpBits = kMemUnitBits;
+  cudaStream_t stream = mshadow::Stream<gpu>::GetStream(dst.stream_);
+  IndexType* sum_counts_ptr = nullptr;
+  int* num_runs_ptr = nullptr;
+  if (dst.size(0)*4 < src.size(0) && workspace != nullptr) {
+    // Workspace given and potentially loops at least 4 times, use CUB to create sum_counts
+    CHECK_EQ(workspace->CheckContiguous(), true);
+    // workspace = [unique_out, counts_out, temporary_storage]
+    size_t unique_bytes = sorted.size(0)*sizeof(IndexType);
+    size_t counts_bytes = sorted.size(0)*sizeof(IndexType);
+    size_t num_runs_bytes = 1*sizeof(int);
+
+    size_t encode_bytes = 0;
+    cub::DeviceRunLengthEncode::Encode<IndexType*, IndexType*, IndexType*, int*>
+      (nullptr, encode_bytes, nullptr, nullptr, nullptr, nullptr, sorted.size(0), stream);
+    size_t exclusivesum_bytes = 0;
+    cub::DeviceScan::ExclusiveSum<IndexType*, IndexType*>
+      (nullptr, exclusivesum_bytes, nullptr, nullptr, sorted.size(0), stream);
+    size_t temporary_bytes = std::max(encode_bytes, exclusivesum_bytes);
+
+    // Check that we have enough storage
+    CHECK_GE(workspace->size(0), unique_bytes + counts_bytes +
+      num_runs_bytes + temporary_bytes);
+
+    IndexType* unique_out_ptr = reinterpret_cast<IndexType*>(workspace->dptr_);
+    IndexType* counts_out_ptr = reinterpret_cast<IndexType*>(workspace->dptr_ + unique_bytes);
+    num_runs_ptr = reinterpret_cast<int*>(workspace->dptr_ + unique_bytes +
+      counts_bytes);
+    void* temporary_storage = reinterpret_cast<void *>(workspace->dptr_ + unique_bytes +
+      counts_bytes + num_runs_bytes);
+
+    cub::DeviceRunLengthEncode::Encode<IndexType*, IndexType*, IndexType*, int*>
+    (temporary_storage, temporary_bytes, sorted.dptr_, unique_out_ptr, counts_out_ptr,
+      num_runs_ptr, sorted.size(0), stream);
+
+    sum_counts_ptr = unique_out_ptr;
+    cub::DeviceScan::ExclusiveSum<IndexType*, IndexType*>
+    (temporary_storage, temporary_bytes, counts_out_ptr, sum_counts_ptr,
+      sorted.size(0), stream);
+  }
+  AddTakeGradLargeBatchKernelLaunch(dst, sorted, index, src, sum_counts_ptr,
+                                    num_runs_ptr, dst.size(0));
 }
 
 }  // namespace op

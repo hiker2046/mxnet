@@ -1,3 +1,22 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 /*!
  *  Copyright (c) 2015 by Contributors
  * \file sgd-inl.h
@@ -63,7 +82,7 @@ void sgd_mom_update(RunContext ctx, TBlob weight, const TBlob grad, TBlob mom,
   Tensor<xpu, 2> grad2d = grad.FlatTo2D<xpu, real_t>(s);
   if (param.clip_gradient > 0.0f) {
     mom2d = param.momentum*mom2d -
-            lr*(param.rescale_grad*F<sgd_clip>(grad2d, param.clip_gradient) + wd*weight2d);
+            lr*(F<sgd_clip>(param.rescale_grad * grad2d, param.clip_gradient) + wd*weight2d);
   } else {
     mom2d = param.momentum*mom2d - lr*(param.rescale_grad*grad2d + wd*weight2d);
   }
@@ -79,7 +98,7 @@ void sgd_update(RunContext ctx, TBlob weight, const TBlob grad,
   Tensor<xpu, 2> weight2d = weight.FlatTo2D<xpu, real_t>(s);
   Tensor<xpu, 2> grad2d = grad.FlatTo2D<xpu, real_t>(s);
   if (param.clip_gradient >= 0.0f) {
-    weight2d -= lr*(param.rescale_grad*F<sgd_clip>(grad2d, param.clip_gradient) +
+    weight2d -= lr*(F<sgd_clip>(param.rescale_grad * grad2d, param.clip_gradient) +
                 wd*weight2d);
   } else {
     weight2d -= lr*(param.rescale_grad*grad2d + wd*weight2d);
@@ -123,12 +142,12 @@ class SGDOpt : public Optimizer {
         Engine::Get()->PushSync([this, index, w, g, lr, wd](RunContext ctx) {
           call_sgd_mom_update_cpu(ctx, w.data(), g.data(), mom[index].data(), lr, wd, param_);
         }, w.ctx(), {g.var()}, {w.var(), mom[index].var()},
-        FnProperty::kNormal, 0, PROFILER_MESSAGE("SGDOptUpdate"));
+        FnProperty::kNormal, 0, "SGDOptUpdate");
       } else {
         Engine::Get()->PushSync([this, index, w, g, lr, wd](RunContext ctx) {
           call_sgd_update_cpu(ctx, w.data(), g.data(), lr, wd, param_);
         }, w.ctx(), {g.var()}, {w.var()},
-        FnProperty::kNormal, 0, PROFILER_MESSAGE("SGDOptUpdate"));
+        FnProperty::kNormal, 0, "SGDOptUpdate");
       }
       break;
      case Context::kGPU:
@@ -137,12 +156,12 @@ class SGDOpt : public Optimizer {
         Engine::Get()->PushSync([this, index, w, g, lr, wd](RunContext ctx) {
           call_sgd_mom_update_gpu(ctx, w.data(), g.data(), mom[index].data(), lr, wd, param_);
         }, w.ctx(), {g.var()}, {w.var(), mom[index].var()},
-        FnProperty::kNormal, 0, PROFILER_MESSAGE("SGDOptUpdate"));
+        FnProperty::kNormal, 0, "SGDOptUpdate");
       } else {
         Engine::Get()->PushSync([this, index, w, g, lr, wd](RunContext ctx) {
           call_sgd_update_gpu(ctx, w.data(), g.data(), lr, wd, param_);
         }, w.ctx(), {g.var()}, {w.var()},
-        FnProperty::kNormal, 0, PROFILER_MESSAGE("SGDOptUpdate"));
+        FnProperty::kNormal, 0, "SGDOptUpdate");
       }
       break;
 #else

@@ -1,3 +1,22 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 /*!
  *  Copyright (c) 2015 by Contributors
  * \file iter_image_recordio-inl.hpp
@@ -13,9 +32,11 @@
 #include <dmlc/parameter.h>
 #include <dmlc/recordio.h>
 #include <dmlc/threadediter.h>
+#include <memory>
 #include <unordered_map>
 #include <vector>
 #include <cstdlib>
+#include "./image_iter_common.h"
 #include "./inst_vector.h"
 #include "./image_recordio.h"
 #include "./image_augmenter.h"
@@ -25,126 +46,6 @@
 
 namespace mxnet {
 namespace io {
-/*! \brief data structure to hold labels for images */
-class ImageLabelMap {
- public:
-  /*!
-   * \brief initialize the label list into memory
-   * \param path_imglist path to the image list
-   * \param label_width predefined label_width
-   */
-  explicit ImageLabelMap(const char *path_imglist,
-                         mshadow::index_t label_width,
-                         bool silent) {
-    this->label_width = label_width;
-    image_index_.clear();
-    label_.clear();
-    idx2label_.clear();
-    dmlc::InputSplit *fi = dmlc::InputSplit::Create
-        (path_imglist, 0, 1, "text");
-    dmlc::InputSplit::Blob rec;
-    while (fi->NextRecord(&rec)) {
-      // quick manual parsing
-      char *p = reinterpret_cast<char*>(rec.dptr);
-      char *end = p + rec.size;
-      // skip space
-      while (isspace(*p) && p != end) ++p;
-      image_index_.push_back(static_cast<size_t>(atol(p)));
-      for (size_t i = 0; i < label_width; ++i) {
-        // skip till space
-        while (!isspace(*p) && p != end) ++p;
-        // skip space
-        while (isspace(*p) && p != end) ++p;
-        CHECK(p != end) << "Bad ImageList format";
-        label_.push_back(static_cast<real_t>(atof(p)));
-      }
-    }
-    delete fi;
-    // be careful not to resize label_ afterwards
-    idx2label_.reserve(image_index_.size());
-    for (size_t i = 0; i < image_index_.size(); ++i) {
-      idx2label_[image_index_[i]] = dmlc::BeginPtr(label_) + i * label_width;
-    }
-    if (!silent) {
-      LOG(INFO) << "Loaded ImageList from " << path_imglist << ' '
-                << image_index_.size() << " Image records";
-    }
-  }
-  /*! \brief find a label for corresponding index */
-  inline mshadow::Tensor<cpu, 1> Find(size_t imid) const {
-    std::unordered_map<size_t, real_t*>::const_iterator it
-        = idx2label_.find(imid);
-    CHECK(it != idx2label_.end()) << "fail to find imagelabel for id " << imid;
-    return mshadow::Tensor<cpu, 1>(it->second, mshadow::Shape1(label_width));
-  }
-
- private:
-  // label with_
-  mshadow::index_t label_width;
-  // image index of each record
-  std::vector<size_t> image_index_;
-  // real label content
-  std::vector<real_t> label_;
-  // map index to label
-  std::unordered_map<size_t, real_t*> idx2label_;
-};
-
-// Define image record parser parameters
-struct ImageRecParserParam : public dmlc::Parameter<ImageRecParserParam> {
-  /*! \brief path to image list */
-  std::string path_imglist;
-  /*! \brief path to image recordio */
-  std::string path_imgrec;
-  /*! \brief a sequence of names of image augmenters, seperated by , */
-  std::string aug_seq;
-  /*! \brief label-width */
-  int label_width;
-  /*! \brief input shape */
-  TShape data_shape;
-  /*! \brief number of threads */
-  int preprocess_threads;
-  /*! \brief whether to remain silent */
-  bool verbose;
-  /*! \brief partition the data into multiple parts */
-  int num_parts;
-  /*! \brief the index of the part will read*/
-  int part_index;
-  /*! \brief the size of a shuffle chunk*/
-  size_t shuffle_chunk_size;
-  /*! \brief the seed for chunk shuffling*/
-  int shuffle_chunk_seed;
-
-  // declare parameters
-  DMLC_DECLARE_PARAMETER(ImageRecParserParam) {
-    DMLC_DECLARE_FIELD(path_imglist).set_default("")
-        .describe("Dataset Param: Path to image list.");
-    DMLC_DECLARE_FIELD(path_imgrec).set_default("./data/imgrec.rec")
-        .describe("Dataset Param: Path to image record file.");
-    DMLC_DECLARE_FIELD(aug_seq).set_default("aug_default")
-        .describe("Augmentation Param: the augmenter names to represent"\
-                  " sequence of augmenters to be applied, seperated by comma." \
-                  " Additional keyword parameters will be seen by these augmenters.");
-    DMLC_DECLARE_FIELD(label_width).set_lower_bound(1).set_default(1)
-        .describe("Dataset Param: How many labels for an image.");
-    DMLC_DECLARE_FIELD(data_shape)
-        .set_expect_ndim(3).enforce_nonzero()
-        .describe("Dataset Param: Shape of each instance generated by the DataIter.");
-    DMLC_DECLARE_FIELD(preprocess_threads).set_lower_bound(1).set_default(4)
-        .describe("Backend Param: Number of thread to do preprocessing.");
-    DMLC_DECLARE_FIELD(verbose).set_default(true)
-        .describe("Auxiliary Param: Whether to output parser information.");
-    DMLC_DECLARE_FIELD(num_parts).set_default(1)
-        .describe("partition the data into multiple parts");
-    DMLC_DECLARE_FIELD(part_index).set_default(0)
-        .describe("the index of the part will read");
-    DMLC_DECLARE_FIELD(shuffle_chunk_size).set_default(0)
-        .describe("the size(MB) of the shuffle chunk, used with shuffle=True,"\
-                  " it can enable global shuffling");
-    DMLC_DECLARE_FIELD(shuffle_chunk_seed).set_default(0)
-        .describe("the seed for chunk shuffling");
-  }
-};
-
 // parser to parse image recordio
 template<typename DType>
 class ImageRecordIOParser {
@@ -153,7 +54,7 @@ class ImageRecordIOParser {
   inline void Init(const std::vector<std::pair<std::string, std::string> >& kwargs);
 
   // set record to the head
-  inline void BeforeFirst(void) {
+  inline void BeforeFirst() {
     return source_->BeforeFirst();
   }
   // parse next set of records, return an array of
@@ -211,8 +112,8 @@ inline void ImageRecordIOParser<DType>::Init(
     prnds_.emplace_back(new common::RANDOM_ENGINE((i + 1) * kRandMagic));
   }
   if (param_.path_imglist.length() != 0) {
-    label_map_.reset(new ImageLabelMap(param_.path_imglist.c_str(),
-      param_.label_width, !param_.verbose));
+    label_map_ = std::make_unique<ImageLabelMap>(param_.path_imglist.c_str(),
+      param_.label_width, !param_.verbose);
   }
   CHECK(param_.path_imgrec.length() != 0)
       << "ImageRecordIOIterator: must specify image_rec";
@@ -298,7 +199,7 @@ ParseNext(std::vector<InstVector<DType>> *out_vec) {
       }
       const int n_channels = res.channels();
       for (auto& aug : augmenters_[tid]) {
-        res = aug->Process(res, prnds_[tid].get());
+        res = aug->Process(res, nullptr, prnds_[tid].get());
       }
       out.Push(static_cast<unsigned>(rec.image_index()),
                mshadow::Shape3(n_channels, res.rows, res.cols),
@@ -326,7 +227,7 @@ ParseNext(std::vector<InstVector<DType>> *out_vec) {
       mshadow::Tensor<cpu, 1> label = out.label().Back();
       if (label_map_ != nullptr) {
         mshadow::Copy(label, label_map_->Find(rec.image_index()));
-      } else if (rec.label != NULL) {
+      } else if (rec.label != nullptr) {
         CHECK_EQ(param_.label_width, rec.num_label)
           << "rec file provide " << rec.num_label << "-dimensional label "
              "but label_width is set to " << param_.label_width;
@@ -342,29 +243,10 @@ ParseNext(std::vector<InstVector<DType>> *out_vec) {
     }
   }
 #else
-      LOG(FATAL) << "Opencv is needed for image decoding and augmenting.";
-#endif
+  LOG(FATAL) << "Opencv is needed for image decoding and augmenting.";
+#endif  // MXNET_USE_OPENCV
   return true;
 }
-
-// Define image record parameters
-struct ImageRecordParam: public dmlc::Parameter<ImageRecordParam> {
-  /*! \brief whether to do shuffle */
-  bool shuffle;
-  /*! \brief random seed */
-  int seed;
-  /*! \brief whether to remain silent */
-  bool verbose;
-  // declare parameters
-  DMLC_DECLARE_PARAMETER(ImageRecordParam) {
-    DMLC_DECLARE_FIELD(shuffle).set_default(false)
-        .describe("Augmentation Param: Whether to shuffle data.");
-    DMLC_DECLARE_FIELD(seed).set_default(0)
-        .describe("Augmentation Param: Random Seed.");
-    DMLC_DECLARE_FIELD(verbose).set_default(true)
-        .describe("Auxiliary Param: Whether to output information.");
-  }
-};
 
 // iterator on image recordio
 template<typename DType = real_t>
@@ -372,12 +254,12 @@ class ImageRecordIter : public IIterator<DataInst> {
  public:
   ImageRecordIter() : data_(nullptr) { }
   // destructor
-  virtual ~ImageRecordIter(void) {
+  ~ImageRecordIter() override {
     iter_.Destroy();
     delete data_;
   }
   // constructor
-  virtual void Init(const std::vector<std::pair<std::string, std::string> >& kwargs) {
+  void Init(const std::vector<std::pair<std::string, std::string> >& kwargs) override {
     param_.InitAllowUnknown(kwargs);
     // use the kwarg to init parser
     parser_.Init(kwargs);
@@ -395,13 +277,13 @@ class ImageRecordIter : public IIterator<DataInst> {
     rnd_.seed(kRandMagic + param_.seed);
   }
   // before first
-  virtual void BeforeFirst(void) {
+  void BeforeFirst() override {
     iter_.BeforeFirst();
     inst_order_.clear();
     inst_ptr_ = 0;
   }
 
-  virtual bool Next(void) {
+  bool Next() override {
     while (true) {
       if (inst_ptr_ < inst_order_.size()) {
         std::pair<unsigned, unsigned> p = inst_order_[inst_ptr_];
@@ -415,7 +297,7 @@ class ImageRecordIter : public IIterator<DataInst> {
         for (unsigned i = 0; i < data_->size(); ++i) {
           const InstVector<DType>& tmp = (*data_)[i];
           for (unsigned j = 0; j < tmp.Size(); ++j) {
-            inst_order_.push_back(std::make_pair(i, j));
+            inst_order_.emplace_back(i, j);
           }
         }
         // shuffle instance order if needed
@@ -428,7 +310,7 @@ class ImageRecordIter : public IIterator<DataInst> {
     return false;
   }
 
-  virtual const DataInst &Value(void) const {
+  const DataInst &Value() const override {
     return out_;
   }
 
@@ -453,11 +335,22 @@ class ImageRecordIter : public IIterator<DataInst> {
   common::RANDOM_ENGINE rnd_;
 };
 
-DMLC_REGISTER_PARAMETER(ImageRecParserParam);
-DMLC_REGISTER_PARAMETER(ImageRecordParam);
+// OLD VERSION - DEPRECATED
+MXNET_REGISTER_IO_ITER(ImageRecordIter_v1)
+.describe(R"code(Iterating on image RecordIO files
 
-MXNET_REGISTER_IO_ITER(ImageRecordIter)
-.describe("Create iterator for dataset packed in recordio.")
+.. note::
+
+  ``ImageRecordIter_v1`` is deprecated. Use ``ImageRecordIter`` instead.
+
+
+Read images batches from RecordIO files with a rich of data augmentation
+options.
+
+One can use ``tools/im2rec.py`` to pack individual image files into RecordIO
+files.
+
+)code" ADD_FILELINE)
 .add_arguments(ImageRecParserParam::__FIELDS__())
 .add_arguments(ImageRecordParam::__FIELDS__())
 .add_arguments(BatchParam::__FIELDS__())
@@ -471,8 +364,18 @@ MXNET_REGISTER_IO_ITER(ImageRecordIter)
                 new ImageRecordIter<real_t>())));
   });
 
-MXNET_REGISTER_IO_ITER(ImageRecordUInt8Iter)
-.describe("Create iterator for dataset packed in recordio.")
+// OLD VERSION - DEPRECATED
+MXNET_REGISTER_IO_ITER(ImageRecordUInt8Iter_v1)
+.describe(R"code(Iterating on image RecordIO files
+
+.. note::
+
+  ``ImageRecordUInt8Iter_v1`` is deprecated. Use ``ImageRecordUInt8Iter`` instead.
+
+This iterator is identical to ``ImageRecordIter`` except for using ``uint8`` as
+the data type instead of ``float``.
+
+)code" ADD_FILELINE)
 .add_arguments(ImageRecParserParam::__FIELDS__())
 .add_arguments(ImageRecordParam::__FIELDS__())
 .add_arguments(BatchParam::__FIELDS__())

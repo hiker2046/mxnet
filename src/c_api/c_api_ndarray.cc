@@ -1,6 +1,25 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 /*!
  *  Copyright (c) 2016 by Contributors
- * \file c_api_symbolic.cc
+ * \file c_api_ndarray.cc
  * \brief C API of mxnet
  */
 
@@ -9,12 +28,113 @@
 #include <mxnet/operator.h>
 #include <mxnet/operator_util.h>
 #include <mxnet/op_attr_types.h>
+#include <mxnet/imperative.h>
 #include <nnvm/node.h>
 #include <nnvm/op_attr_types.h>
+#include <string>
 #include "./c_api_common.h"
 #include "../common/utils.h"
+#include "../common/exec_utils.h"
+#include "../imperative/imperative_utils.h"
+#include "../imperative/cached_op.h"
+#include "../imperative/cached_op_threadsafe.h"
+#include "../profiler/profiler.h"
 
 using namespace mxnet;
+
+void SetNDInputsOutputs(const nnvm::Op* op,
+                        std::vector<NDArray*>* ndinputs,
+                        std::vector<NDArray*>* ndoutputs,
+                        int num_inputs,
+                        const NDArrayHandle *inputs,
+                        int *num_outputs,
+                        int infered_num_outputs,
+                        int num_visible_outputs,
+                        NDArrayHandle **outputs) {
+  NDArray** out_array = *reinterpret_cast<NDArray***>(outputs);
+
+  ndinputs->clear();
+  ndinputs->reserve(num_inputs);
+  for (int i = 0; i < num_inputs; ++i) {
+    NDArray* inp = reinterpret_cast<NDArray*>(inputs[i]);
+    if (!features::is_enabled(features::INT64_TENSOR_SIZE)) {
+      if (shape_is_known(inp->shape())) {  // Shape may be unknown after dynamic shape operators
+        CHECK_LT(inp->shape().Size(), (int64_t{1} << 31) - 1) <<
+          "[SetNDInputsOutputs] Size of tensor you are trying to allocate is larger than "
+          "2^31 elements. Please build with flag USE_INT64_TENSOR_SIZE=1";
+      }
+    }
+    ndinputs->emplace_back(inp);
+  }
+
+  ndoutputs->clear();
+  ndoutputs->reserve(infered_num_outputs);
+  if (out_array == nullptr) {
+    for (int i = 0; i < infered_num_outputs; ++i) {
+      ndoutputs->emplace_back(new NDArray());
+    }
+    *num_outputs = num_visible_outputs;
+  } else {
+    CHECK(*num_outputs == infered_num_outputs || *num_outputs == num_visible_outputs)
+      << "Operator expects " << infered_num_outputs << " (all) or "
+      << num_visible_outputs << " (visible only) outputs, but got "
+      << *num_outputs << " instead.";
+    for (int i = 0; i < *num_outputs; ++i) {
+      ndoutputs->emplace_back(out_array[i]);
+    }
+    for (int i = *num_outputs; i < infered_num_outputs; ++i) {
+      ndoutputs->emplace_back(new NDArray());
+    }
+  }
+}
+
+void MXImperativeInvokeImpl(AtomicSymbolCreator creator,
+                            int num_inputs,
+                            NDArrayHandle *inputs,
+                            int *num_outputs,
+                            NDArrayHandle **outputs,
+                            int num_params,
+                            const char **param_keys,
+                            const char **param_vals) {
+  const nnvm::Op* op = static_cast<nnvm::Op*>(creator);
+  MXAPIThreadLocalEntry<> *ret = MXAPIThreadLocalStore<>::Get();
+
+  nnvm::NodeAttrs attrs = imperative::ParseAttrs(op, num_inputs, num_params,
+                                                 param_keys, param_vals);
+  attrs.dict["__profiler_scope__"] = profiler::ProfilerScope::Get()->GetCurrentProfilerScope();
+  if (attrs.op) {
+    attrs.name = attrs.op->name;
+  }
+
+  int infered_num_outputs;
+  int num_visible_outputs;
+  imperative::SetNumOutputs(op, attrs, num_inputs, &infered_num_outputs, &num_visible_outputs);
+
+  std::vector<NDArray*> ndinputs, ndoutputs;
+  SetNDInputsOutputs(op, &ndinputs, &ndoutputs, num_inputs, inputs,
+      num_outputs, infered_num_outputs, num_visible_outputs, outputs);
+
+  if (Imperative::Get()->is_deferred_compute()) {
+    Imperative::Get()->RecordDeferredCompute(std::move(attrs), ndinputs, ndoutputs);
+  } else {
+    for (NDArray* input : ndinputs) {
+      Imperative::DCInfo::Compute(*input);
+    }
+    auto state = Imperative::Get()->Invoke(Context::CPU(), attrs, ndinputs, ndoutputs);
+    if (Imperative::Get()->is_recording()) {
+      Imperative::Get()->RecordOp(std::move(attrs), ndinputs, ndoutputs, state);
+    }
+  }
+
+  for (int i = *num_outputs; i < infered_num_outputs; ++i) delete ndoutputs[i];
+
+  if (*outputs == nullptr) {
+    ret->ret_handles.clear();
+    ret->ret_handles.reserve(*num_outputs);
+    for (int i = 0; i < *num_outputs; ++i) ret->ret_handles.push_back(ndoutputs[i]);
+    *outputs = reinterpret_cast<NDArrayHandle*>(dmlc::BeginPtr(ret->ret_handles));
+  }
+}
 
 int MXImperativeInvoke(AtomicSymbolCreator creator,
                        int num_inputs,
@@ -23,272 +143,311 @@ int MXImperativeInvoke(AtomicSymbolCreator creator,
                        NDArrayHandle **outputs,
                        int num_params,
                        const char **param_keys,
-                       const char **param_vals) {
-  static auto& num_args = nnvm::Op::GetAttr<std::string>("key_var_num_args");
-  static auto& infershape = nnvm::Op::GetAttr<nnvm::FInferShape>("FInferShape");
-  static auto& infertype = nnvm::Op::GetAttr<nnvm::FInferType>("FInferType");
-  static auto& visible_out = nnvm::Op::GetAttr<nnvm::FNumVisibleOutputs>("FNumVisibleOutputs");
-  static auto& fcpu = nnvm::Op::GetAttr<FCompute>("FCompute<cpu>");
-  static auto& fgpu = nnvm::Op::GetAttr<FCompute>("FCompute<gpu>");
-  static auto& ndfunc = nnvm::Op::GetAttr<FNDArrayFunction>("FNDArrayFunction");
-  static auto& createop = nnvm::Op::GetAttr<FCreateLayerOp>("FCreateLayerOp");
-  static auto& mutate = nnvm::Op::GetAttr<nnvm::FMutateInputs>("FMutateInputs");
-  static auto& tmp_resource = nnvm::Op::GetAttr<FResourceRequest>("FResourceRequest");
-  const nnvm::Op* op = static_cast<nnvm::Op*>(creator);
-  NDArray** outarray = *reinterpret_cast<NDArray***>(outputs);
-  MXAPIThreadLocalEntry *ret = MXAPIThreadLocalStore::Get();
-
+                       const char **param_vals,
+                       const int **out_stypes) {  // outputs storage types
+  MXAPIThreadLocalEntry<> *ret = MXAPIThreadLocalStore<>::Get();
   API_BEGIN();
-  nnvm::NodeAttrs attrs;
-  attrs.op = op;
-  for (int i = 0; i < num_params; ++i) {
-    attrs.dict.emplace(param_keys[i], param_vals[i]);
+  MXImperativeInvokeImpl(creator, num_inputs, inputs, num_outputs, outputs,
+                         num_params, param_keys, param_vals);
+  NDArray** out_array = *reinterpret_cast<NDArray***>(outputs);
+  ret->out_types.clear();
+  ret->out_types.reserve(*num_outputs);
+  for (int i = 0; i < *num_outputs; ++i) {
+    ret->out_types.emplace_back(out_array[i]->storage_type());
   }
+  *out_stypes = dmlc::BeginPtr(ret->out_types);
+  API_END();
+}
 
-  if (num_args.count(op)) {
-    attrs.dict.emplace(num_args[op], std::to_string(num_inputs));
+int MXCreateCachedOp(SymbolHandle handle,
+                     int num_flags,
+                     const char** keys,
+                     const char** vals,
+                     CachedOpHandle *out,
+                     bool thread_safe) {
+  nnvm::Symbol* sym = static_cast<nnvm::Symbol*>(handle);
+  API_BEGIN();
+  std::vector<std::pair<std::string, std::string> > flags;
+  flags.reserve(num_flags);
+  for (int i = 0; i < num_flags; ++i) {
+    flags.emplace_back(keys[i], vals[i]);
   }
-  if (op->attr_parser != nullptr) {
-    op->attr_parser(&attrs);
-  }
-  int infered_num_inputs;
-  if (op->get_num_inputs != nullptr) {
-    infered_num_inputs = op->get_num_inputs(attrs);
+  if (!thread_safe) {
+    *out = new CachedOpPtr(new CachedOp(*sym, flags));
   } else {
-    infered_num_inputs = op->num_inputs;
-  }
-  CHECK_EQ(num_inputs, infered_num_inputs)
-    << "Expecting " << infered_num_inputs << " inputs, got "
-    << num_inputs << " in operator " << op->name;
-  int infered_num_outputs;
-  if (op->get_num_outputs != nullptr) {
-    infered_num_outputs = op->get_num_outputs(attrs);
-  } else {
-    infered_num_outputs = op->num_outputs;
-  }
-  int num_visible_outputs = infered_num_outputs;
-  if (visible_out.count(op)) {
-    num_visible_outputs = visible_out[op](attrs);
-    CHECK_LE(num_visible_outputs, infered_num_outputs);
-  }
-
-  std::vector<NDArray> ndinputs, ndoutputs;
-  ndinputs.reserve(num_inputs);
-  for (int i = 0; i < num_inputs; ++i) {
-    ndinputs.emplace_back(*reinterpret_cast<NDArray*>(inputs[i]));
-  }
-  if (outarray == nullptr) {
-    *num_outputs = num_visible_outputs;
-    ndoutputs.resize(infered_num_outputs);
-  } else {
-    CHECK(*num_outputs == infered_num_outputs || *num_outputs == num_visible_outputs)
-      << "Expecting " << infered_num_outputs << " (all) or "
-      << num_visible_outputs << " (visible only) outputs, got "
-      << *num_outputs << " in operator " << op->name;
-    ndoutputs.reserve(infered_num_outputs);
-    for (int i = 0; i < num_visible_outputs; ++i) {
-      ndoutputs.emplace_back(std::move(*outarray[i]));
-    }
-    ndoutputs.resize(infered_num_outputs);
-  }
-
-  if (ndfunc.count(op)) {
-    ndfunc[op](attrs, ndinputs, &ndoutputs);
-  } else {
-    // TODO(piiswrong): infer ctx
-    Context ctx;
-    if (num_inputs) {
-      ctx = ndinputs[0].ctx();
-    } else if (infered_num_outputs && !ndoutputs[0].is_none()) {
-      ctx = ndoutputs[0].ctx();
-    } else if (attrs.dict.find("ctx") != attrs.dict.end()) {
-      ctx = Context::FromString(attrs.dict["ctx"]);
-    } else {
-      ctx = Context::CPU();
-    }
-    // Pinned context doesn't propagate
-    if (ctx.dev_type == Context::kCPUPinned) {
-      ctx = Context::CPU();
-    }
-
-    std::vector<TShape>& in_shapes = ret->arg_shapes;
-    std::vector<TShape>& out_shapes = ret->out_shapes;
-    in_shapes.clear();
-    out_shapes.clear();
-
-    for (auto& i : ndinputs) {
-      in_shapes.emplace_back(i.shape());
-    }
-    for (auto& i : ndoutputs) {
-      out_shapes.emplace_back(i.shape());
-    }
-    CHECK(infershape.count(op))
-      << "Operator " << op->name << " is missing FInferShape attribute";
-    CHECK(infershape[op](attrs, &in_shapes, &out_shapes));
-    CHECK_EQ(out_shapes.size(), static_cast<size_t>(infered_num_outputs));
-
-    std::vector<int>& in_types = ret->arg_types;
-    std::vector<int>& out_types = ret->out_types;
-    in_types.clear();
-    out_types.clear();
-
-    for (auto& i : ndinputs) {
-      in_types.push_back(i.dtype());
-    }
-    for (auto& i : ndoutputs) {
-      out_types.push_back(i.dtype());
-    }
-    CHECK(infertype.count(op))
-      << "Operator " << op->name << " is missing FInferType attribute";
-    CHECK(infertype[op](attrs, &in_types, &out_types));
-    CHECK_EQ(out_types.size(), static_cast<size_t>(infered_num_outputs));
-
-    for (int i = 0; i < infered_num_outputs; ++i) {
-      if (ndoutputs[i].is_none()) {
-        ndoutputs[i] = NDArray(out_shapes[i], ctx, true, out_types[i]);
-      } else {
-        CHECK_EQ(ndoutputs[i].shape(), out_shapes[i])
-          << i << "th output has invalid shape. "
-          << "Expecting " << out_shapes[i] << " got "
-          << ndoutputs[i].shape() << " in operator " << op->name;
-        CHECK_EQ(ndoutputs[i].dtype(), out_types[i])
-          << i << "th output has invalid shape. "
-          << "Expecting " << out_types[i] << " got "
-          << ndoutputs[i].dtype()  << " in operator " << op->name;
-      }
-    }
-
-    std::vector<engine::VarHandle> read_vars, write_vars;
-    // request resources
-    std::vector<Resource> requested;
-    if (tmp_resource.count(op)) {
-      int ntmp = 0;
-      for (const auto& req : tmp_resource[op](attrs)) {
-        switch (req.type) {
-         case ResourceRequest::kTempSpace:
-          ++ntmp;
-         case ResourceRequest::kRandom:
-          requested.push_back(ResourceManager::Get()->Request(ctx, req));
-          write_vars.push_back(requested.back().var);
-          break;
-         default:
-          LOG(FATAL) << "resource type not yet supported";
-        }
-      }
-      CHECK_LE(ntmp, 1) << "Only support 1 temp space request";
-    }
-
-    std::vector<uint32_t> auxidx;
-    for (auto& i : ndinputs) {
-      read_vars.push_back(i.var());
-    }
-    for (auto& i : ndoutputs) {
-      write_vars.push_back(i.var());
-    }
-    if (mutate.count(op)) {
-      auxidx = mutate[op](attrs);
-      std::sort(auxidx.begin(), auxidx.end());
-      for (auto & i : auxidx) {
-        write_vars.push_back(ndinputs[i].var());
-      }
-    }
-    common::DeduplicateVarHandle(&read_vars, &write_vars);
-
-    FCompute fn;
-    if (ctx.dev_mask() == cpu::kDevMask && fcpu.count(op)) {
-      fn = fcpu[op];
-    } else if (ctx.dev_mask() == gpu::kDevMask && fgpu.count(op)) {
-      fn = fgpu[op];
-    }
-    if (fn) {
-      Engine::Get()->PushAsync(
-        [ctx, attrs, fn, ndinputs, ndoutputs, requested](
-            RunContext rctx,
-            engine::CallbackOnComplete on_complete) {
-          std::vector<TBlob> input_blobs, output_blobs;
-          for (auto& i : ndinputs) {
-            input_blobs.push_back(i.data());
-          }
-          for (auto& i : ndoutputs) {
-            i.CheckAndAlloc();
-            output_blobs.push_back(i.data());
-          }
-          OpContext opctx{false, rctx,
-                          engine::CallbackOnComplete(),
-                          requested};
-          std::vector<OpReqType> req(output_blobs.size(), kWriteTo);
-          fn(attrs, opctx, input_blobs, req, output_blobs);
-          if (ctx.dev_mask() == gpu::kDevMask) {
-            rctx.get_stream<gpu>()->Wait();
-          }
-          on_complete();
-        }, ctx, read_vars, write_vars, FnProperty::kNormal,
-        0, PROFILER_MESSAGE(op->name.c_str()));
-    } else if (createop.count(op)) {
-      Operator* opr = createop[op](attrs, ctx, in_shapes, in_types);
-      struct Capture {
-        engine::CallbackOnComplete on_complete;
-        Operator *opr;
-      };
-      Engine::Get()->PushAsync(
-        [ctx, opr, auxidx, ndinputs, ndoutputs, requested](
-            RunContext rctx,
-            engine::CallbackOnComplete on_complete) {
-          std::vector<TBlob> input_blobs, aux_blobs, output_blobs;
-          auto atop = auxidx.begin();
-          for (size_t i = 0; i < ndinputs.size(); ++i) {
-            if (atop != auxidx.end() && i == *atop) {
-              aux_blobs.push_back(ndinputs[i].data());
-              ++atop;
-            } else {
-              input_blobs.push_back(ndinputs[i].data());
-            }
-          }
-          for (auto& i : ndoutputs) {
-            i.CheckAndAlloc();
-            output_blobs.push_back(i.data());
-          }
-          Capture* capture = new Capture({on_complete, opr});
-          OpContext opctx{false, rctx,
-                          Engine::Get()->CreateCallback(
-                            [](Engine* engine, void *cpt_handle) {
-                                Capture* cpt = static_cast<Capture*>(cpt_handle);
-                                cpt->on_complete();
-                                delete cpt->opr;
-                                delete cpt;
-                              }, static_cast<void*>(capture)),
-                          requested};
-          std::vector<OpReqType> req(output_blobs.size(), kWriteTo);
-          opr->Forward(opctx, input_blobs, req, output_blobs, aux_blobs);
-          if (opr->exec_type() != Operator::kAsync) {
-            if (ctx.dev_mask() == gpu::kDevMask) {
-              rctx.get_stream<gpu>()->Wait();
-            }
-            delete opr;
-            delete capture;
-            on_complete();
-          }
-        }, ctx, read_vars, write_vars, FnProperty::kNormal,
-        0, PROFILER_MESSAGE(op->name.c_str()));
-    } else {
-      LOG(FATAL)
-        << "Operator " << op->name
-        << " cannot be run; requires at least one of"
-        << " FCompute<xpu>, NDArrayFunction, FCreateOperator be registered";
-    }
-  }
-
-  if (outarray == nullptr) {
-    ret->ret_handles.clear();
-    for (int i = 0; i < num_visible_outputs; ++i) {
-      ret->ret_handles.push_back(
-        reinterpret_cast<NDArrayHandle>(new NDArray(std::move(ndoutputs[i]))));
-    }
-    *outputs = dmlc::BeginPtr(ret->ret_handles);
-  } else {
-    for (int i = 0; i < *num_outputs; ++i) {
-      *outarray[i] = std::move(ndoutputs[i]);
-    }
+    *out = new CachedOpPtr(new CachedOpThreadSafe(*sym, flags));
   }
   API_END();
+}
+
+int MXFreeCachedOp(CachedOpHandle handle) {
+  CachedOpPtr* g = static_cast<CachedOpPtr*>(handle);
+  API_BEGIN();
+  delete g;
+  API_END();
+}
+
+/*!
+ * \brief get optimized graph from the cached op
+ */
+int MXCachedOpGetOptimizedSymbol(CachedOpHandle handle,
+                                 SymbolHandle *out) {
+  auto s = new nnvm::Symbol();
+  API_BEGIN();
+  CachedOpPtr op = *static_cast<CachedOpPtr*>(handle);
+  *s = op->GetOptimizedSymbol();
+  *out = s;
+  API_END_HANDLE_ERROR(delete s);
+}
+
+int MXInvokeCachedOp(CachedOpHandle handle,
+                     int num_inputs,
+                     NDArrayHandle *inputs,
+                     int default_dev_type,
+                     int default_dev_id,
+                     int *num_outputs,
+                     NDArrayHandle **outputs,
+                     const int **out_stypes) {  // outputs storage types
+  MXAPIThreadLocalEntry<> *ret = MXAPIThreadLocalStore<>::Get();
+
+  API_BEGIN();
+  CachedOpPtr op_shared = *static_cast<CachedOpPtr*>(handle);
+  // CachedOp* points to CachedOpThreadSafe object if CreateCachedOpEX
+  // was called with thread_safe=true
+  CachedOp* op = dynamic_cast<CachedOp*>(op_shared.get());
+  std::vector<NDArray*> ndinputs;
+  ndinputs.reserve(num_inputs);
+  for (int i = 0; i < num_inputs; ++i) {
+    ndinputs.push_back(reinterpret_cast<NDArray*>(inputs[i]));
+  }
+
+  std::vector<NDArray*> ndoutputs;
+  ndoutputs.reserve(op->num_outputs());
+  if (*outputs == nullptr) {
+    *num_outputs = op->num_outputs();
+    for (int i = 0; i < *num_outputs; ++i) ndoutputs.push_back(new NDArray());
+  } else {
+    CHECK_EQ(*num_outputs, op->num_outputs())
+        << "CachedOp expects " << op->num_outputs() << " outputs, but "
+        << *num_outputs << " was given.";
+    for (int i = 0; i < *num_outputs; ++i) {
+      ndoutputs.push_back(reinterpret_cast<NDArray*>((*outputs)[i]));
+    }
+  }
+  // construct default context
+  Context ctx = Context::Create(static_cast<Context::DeviceType>(default_dev_type),
+                                default_dev_id);
+  op->Forward(op_shared, ndinputs, ndoutputs, ctx);
+
+  if (*outputs == nullptr) {
+    ret->ret_handles.clear();
+    ret->ret_handles.reserve(*num_outputs);
+    for (int i = 0; i < *num_outputs; ++i) {
+      ret->ret_handles.push_back(ndoutputs[i]);
+    }
+    *outputs = dmlc::BeginPtr(ret->ret_handles);
+  }
+
+  NDArray** out_array = reinterpret_cast<NDArray**>(*outputs);
+  ret->out_types.clear();
+  ret->out_types.reserve(*num_outputs);
+  for (int i = 0; i < *num_outputs; ++i) {
+    ret->out_types.emplace_back(out_array[i]->storage_type());
+  }
+  *out_stypes = dmlc::BeginPtr(ret->out_types);
+
+  API_END();
+}
+
+int MXAutogradIsTraining(bool* curr) {
+  API_BEGIN();
+  *curr = Imperative::Get()->is_training();
+  API_END();
+}
+
+int MXAutogradSetIsTraining(int is_training, int* prev) {
+  API_BEGIN();
+  *prev = Imperative::Get()->set_is_training(static_cast<bool>(is_training));
+  API_END();
+}
+
+int MXAutogradIsRecording(bool* curr) {
+  API_BEGIN();
+  *curr = Imperative::Get()->is_recording();
+  API_END();
+}
+
+int MXAutogradSetIsRecording(int is_recording, int* prev) {
+  API_BEGIN();
+  *prev = Imperative::Get()->set_is_recording(static_cast<bool>(is_recording));
+  API_END();
+}
+
+int MXIsNumpyShape(int* curr) {
+  API_BEGIN();
+  *curr = Imperative::Get()->is_np_shape();
+  API_END();
+}
+
+int MXSetIsNumpyShape(int is_np_shape, int* prev) {
+  API_BEGIN();
+  *prev = Imperative::Get()->set_is_np_shape(is_np_shape);
+  API_END();
+}
+
+int MXIsNumpyDefaultDtype(bool* curr) {
+  API_BEGIN();
+  *curr = Imperative::Get()->is_np_default_dtype();
+  API_END();
+}
+
+int MXSetIsNumpyDefaultDtype(bool default_dtype, bool* prev) {
+  API_BEGIN();
+  *prev = Imperative::Get()->set_is_np_default_dtype(default_dtype);
+  API_END();
+}
+
+int MXAutogradMarkVariables(uint32_t num_var,
+                            NDArrayHandle *var_handles,
+                            uint32_t *reqs_array,
+                            NDArrayHandle *grad_handles) {
+  API_BEGIN();
+  std::vector<NDArray*> variables, gradients;
+  std::vector<uint32_t> grad_reqs;
+  variables.reserve(num_var);
+  gradients.reserve(num_var);
+  grad_reqs.reserve(num_var);
+  for (uint32_t i = 0; i < num_var; ++i) {
+    variables.emplace_back(static_cast<NDArray*>(var_handles[i]));
+    gradients.emplace_back(static_cast<NDArray*>(grad_handles[i]));
+    grad_reqs.emplace_back(reqs_array[i]);
+  }
+  Imperative::Get()->MarkVariables(variables, grad_reqs, gradients);
+  API_END();
+}
+
+int MXAutogradComputeGradient(uint32_t num_output,
+                              NDArrayHandle *output_handles) {
+  return MXAutogradBackward(num_output, output_handles, nullptr, 0);
+}
+
+int MXAutogradBackward(uint32_t num_output,
+                       NDArrayHandle *output_handles,
+                       NDArrayHandle *ograd_handles,
+                       int retain_graph) {
+  return MXAutogradBackwardEx(num_output, output_handles, ograd_handles,
+                              0, nullptr, retain_graph, false, true,
+                              nullptr, nullptr);
+}
+
+int MXAutogradBackwardEx(uint32_t num_output,
+                         NDArrayHandle *output_handles,
+                         NDArrayHandle *ograd_handles,
+                         uint32_t num_variables,
+                         NDArrayHandle *var_handles,
+                         int retain_graph,
+                         int create_graph,
+                         int is_train,
+                         NDArrayHandle **grad_handles,
+                         int **grad_stypes) {
+  MXAPIThreadLocalEntry<> *ret = MXAPIThreadLocalStore<>::Get();
+  API_BEGIN();
+
+  std::vector<NDArray*> outputs, ograds, variables;
+  outputs.reserve(num_output);
+  for (uint32_t i = 0; i < num_output; ++i) {
+    outputs.emplace_back(reinterpret_cast<NDArray*>(output_handles[i]));
+  }
+
+  ograds.reserve(num_output);
+  for (uint32_t i = 0; i < num_output; ++i) {
+    if (ograd_handles != nullptr) {
+      ograds.emplace_back(reinterpret_cast<NDArray*>(ograd_handles[i]));
+    } else {
+      ograds.emplace_back(nullptr);
+    }
+  }
+
+  variables.reserve(num_variables);
+  for (uint32_t i = 0; i < num_variables; ++i) {
+    variables.emplace_back(reinterpret_cast<NDArray*>(var_handles[i]));
+  }
+
+  auto grads = Imperative::Get()->Backward(outputs, ograds, variables, is_train,
+                                                  retain_graph, create_graph);
+  if (num_variables != 0) {
+    ret->ret_handles.clear();
+    ret->out_types.clear();
+    ret->ret_handles.reserve(grads.size());
+    ret->out_types.reserve(grads.size());
+    for (const auto& i : grads) {
+      ret->ret_handles.push_back(i);
+      ret->out_types.push_back(i->storage_type());
+    }
+    *grad_handles = dmlc::BeginPtr(ret->ret_handles);
+    *grad_stypes = dmlc::BeginPtr(ret->out_types);
+  }
+  API_END();
+}
+
+int MXAutogradGetSymbol(NDArrayHandle handle, SymbolHandle *out) {
+  API_BEGIN();
+  NDArray *head = reinterpret_cast<NDArray*>(handle);
+  auto sym = new nnvm::Symbol(head->get_autograd_symbol());
+  *out = reinterpret_cast<SymbolHandle>(sym);
+  API_END();
+}
+
+int MXCachedOpRegisterOpHook(NDArrayHandle handle,
+                             CachedOpMonitorCallback callback,
+                             bool monitor_all) {
+  API_BEGIN();
+  CachedOpMonitorCallback callback_temp = nullptr;
+  std::function<void(const char *, const char *, void*)> clbk;
+  if (callback) {
+    callback_temp = callback;
+    clbk = [callback_temp](const char *name, const char *opr_name,
+                           void *handle) {
+      callback_temp(name, opr_name, handle);
+    };
+  } else {
+      clbk = nullptr;
+  }
+  CachedOpPtr op = *static_cast<CachedOpPtr *>(handle);
+  op->RegisterOpHook(clbk, monitor_all);
+  API_END();
+}
+
+int MXNDArrayIsDeferredCompute(int *curr) {
+  API_BEGIN();
+  *curr = Imperative::Get()->is_deferred_compute();
+  API_END();
+}
+
+int MXNDArraySetIsDeferredCompute(int deferred_compute, int *prev) {
+  API_BEGIN();
+  *prev = Imperative::Get()->set_is_deferred_compute(static_cast<bool>(deferred_compute));
+  API_END();
+}
+
+int MXNDArraySetDeferredComputeVariable(NDArrayHandle *arrays, SymbolHandle *variables, int num) {
+  API_BEGIN();
+  Imperative::Get()->SetDeferredComputeVariable(arrays, variables, num);
+  API_END();
+}
+
+int MXNDArrayGetDeferredComputeSymbol(NDArrayHandle *output_handles, int num_outputs,
+                                      SymbolHandle *out) {
+  nnvm::Symbol *s = new nnvm::Symbol();
+  API_BEGIN();
+  std::vector<NDArray *> outputs;
+  outputs.reserve(num_outputs);
+  for (int i = 0; i < num_outputs; ++i) {
+    NDArray *array = reinterpret_cast<NDArray *>(output_handles[i]);
+    outputs.emplace_back(array);
+  }
+  // Obtain Symbol
+  *s = Imperative::Get()->GetDeferredComputeSymbol(outputs);
+  *out = s;
+  API_END_HANDLE_ERROR(delete s;);
 }

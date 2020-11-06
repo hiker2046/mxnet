@@ -1,3 +1,22 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 /*!
  *  Copyright (c) 2016 by Contributors
  * \file legacy_json_util.cc
@@ -11,6 +30,7 @@
 #include <nnvm/node.h>
 #include <nnvm/graph.h>
 #include <nnvm/pass.h>
+#include <nnvm/op_attr_types.h>
 #include <memory>
 #include <functional>
 #include "../c_api/c_api_common.h"
@@ -19,7 +39,7 @@ namespace mxnet {
 using nnvm::Graph;
 using nnvm::Op;
 using nnvm::Node;
-using nnvm::NodePtr;
+using nnvm::ObjectPtr;
 using nnvm::NodeAttrs;
 using nnvm::NodeEntry;
 using nnvm::Symbol;
@@ -37,10 +57,10 @@ Graph UpgradeJSON_FixParsing(Graph g) {
       for (auto it = n->attrs.dict.begin(); it != n->attrs.dict.end();) {
         bool erase = false;
         // remove hidden keys
-        for (const auto key : kHiddenKeys) {
+        for (const auto& key : kHiddenKeys) {
           size_t pos = it->first.rfind(key);
           if (pos == 0 || (pos != std::string::npos && pos == it->first.length() - key.length())) {
-            hidden_keys.push_back(*it);
+            hidden_keys.emplace_back(*it);
             erase = true;
             break;
           }
@@ -56,9 +76,9 @@ Graph UpgradeJSON_FixParsing(Graph g) {
         n->op()->attr_parser(&(n->attrs));
 
       // add back removed hidden keys
-      for (const auto &kv : hidden_keys) {
+      for (const auto& kv : hidden_keys) {
         bool flag = false;
-        for (const auto &key : kHiddenKeys) {
+        for (const auto& key : kHiddenKeys) {
           size_t pos = kv.first.rfind(key);
           if (pos == 0 && key.length() == kv.first.length()) {
             n->attrs.dict["__"+key+"__"] = kv.second;
@@ -131,10 +151,45 @@ Graph UpgradeJSON_000800_000900(Graph g) {
   return g;
 }
 
+// Refactor initializer in v0.9.2
+Graph UpgradeJSON_000903_000904(Graph g) {
+  nnvm::DFSVisit(g.outputs, [](const std::shared_ptr<Node>& n) {
+      static auto& fset_attrs =
+        Op::GetAttr<nnvm::FSetInputVarAttrOnCompose>("FSetInputVarAttrOnCompose");
+
+      if (n->op() != nullptr) {
+        nnvm::FSetInputVarAttrOnCompose fn = fset_attrs.get(n->op(), nullptr);
+        if (fn != nullptr) {
+          for (size_t i = 0; i < n->inputs.size(); ++i) {
+            if (n->inputs[i].node->is_variable()) {
+              fn(n->attrs, n->inputs[i].node, i);
+            }
+          }
+        }
+      }
+    });
+  return g;
+}
+
+// ReduceAxisParam: int axis -> optional<int> axis
+Graph UpgradeJSON_000904_000905(Graph g) {
+  nnvm::DFSVisit(g.outputs, [](const std::shared_ptr<Node>& n) {
+      if (n->op() == nullptr) return;
+      if (n->op()->name != "argmin" && n->op()->name != "argmax") return;
+      if (n->attrs.dict.find("axis") == n->attrs.dict.end() || n->attrs.dict["axis"] != "-1")
+        return;
+      n->attrs.dict.erase("axis");
+      n->op()->attr_parser(&(n->attrs));
+    });
+  return g;
+}
+
 static std::vector<std::pair<int, std::function<Graph(Graph)> > > upgrader_list = {
   {MXNET_VERSION, UpgradeJSON_FixParsing},
   {MXNET_MAKE_VERSION(100, 0, 0), UpgradeJSON_Parse},
   {MXNET_MAKE_VERSION(0, 9, 0), UpgradeJSON_000800_000900},
+  {MXNET_MAKE_VERSION(0, 9, 4), UpgradeJSON_000903_000904},
+  {MXNET_MAKE_VERSION(0, 9, 5), UpgradeJSON_000904_000905},
 };
 
 Graph LoadLegacyJSONPass(Graph g) {
@@ -144,6 +199,7 @@ Graph LoadLegacyJSONPass(Graph g) {
   if (load.attrs.find("mxnet_version") != load.attrs.end()) {
     version = nnvm::get<int>(*load.attrs["mxnet_version"]);
   }
+  bool upgrading = false;
   if (version > MXNET_VERSION) {
     LOG(INFO) << "Warning: loading symbol saved by MXNet version " << version
               << " with lower version of MXNet v" << MXNET_VERSION
@@ -153,10 +209,12 @@ Graph LoadLegacyJSONPass(Graph g) {
     LOG(INFO) << "Loading symbol saved by previous version v"
               << version/10000 << "." << (version/100)%100 << "." << version%100
               << ". Attempting to upgrade...";
+    upgrading = true;
   }
-  for (auto it = upgrader_list.begin(); it != upgrader_list.end(); ++it) {
-    if (it->first > version) load = it->second(load);
+  for (auto& upgrader : upgrader_list) {
+    if (upgrader.first > version) load = upgrader.second(load);
   }
+  if (upgrading) LOG(INFO) << "Symbol successfully upgraded!";
   return load;
 }
 

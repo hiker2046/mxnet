@@ -1,24 +1,46 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
 # coding: utf-8
-# pylint: disable=invalid-name, protected-access, too-many-arguments,  global-statement
-"""Symbolic configuration API."""
-from __future__ import absolute_import as _abs
+# pylint: disable=invalid-name, protected-access, too-many-arguments
+# pylint: disable=global-statement, unused-import
+"""NDArray configuration API."""
 
 import ctypes
-import sys as _sys
-import numpy as np
 
 from ..base import _LIB
-from ..base import c_array, py_str, c_str, mx_uint
-from ..base import NDArrayHandle, OpHandle
+from ..base import c_str_array, c_handle_array
+from ..base import NDArrayHandle, CachedOpHandle, SymbolHandle
 from ..base import check_call
-from ..ndarray_doc import _build_doc
+from .. import _global_var
 
-_ndarray_cls = None
+
+def _monitor_callback_wrapper(callback):
+    """A wrapper for the user-defined handle."""
+    def callback_handle(name, opr_name, array, _):
+        """ ctypes function """
+        callback(name, opr_name, array)
+    return callback_handle
 
 class NDArrayBase(object):
     """Base data structure for ndarray"""
-    __slots__ = ["handle", "writable"]
+    __slots__ = ["handle", "writable", "_alive"]
     # pylint: disable= no-member
+
     def __init__(self, handle, writable=True):
         """initialize a new NDArray
 
@@ -31,144 +53,157 @@ class NDArrayBase(object):
             assert isinstance(handle, NDArrayHandle)
         self.handle = handle
         self.writable = writable
+        self._alive = True
 
     def __del__(self):
         check_call(_LIB.MXNDArrayFree(self.handle))
+        self._alive = False
 
     def __reduce__(self):
-        return (_ndarray_cls, (None,), self.__getstate__())
+        return (_global_var._ndarray_cls, (None,), self.__getstate__())
 
 
-# pylint: disable=too-many-locals, invalid-name
-def _make_ndarray_function(handle, name):
-    """Create a NDArray function from the FunctionHandle."""
-    real_name = ctypes.c_char_p()
-    desc = ctypes.c_char_p()
-    num_args = mx_uint()
-    arg_names = ctypes.POINTER(ctypes.c_char_p)()
-    arg_types = ctypes.POINTER(ctypes.c_char_p)()
-    arg_descs = ctypes.POINTER(ctypes.c_char_p)()
-    key_var_num_args = ctypes.c_char_p()
-    ret_type = ctypes.c_char_p()
+def _imperative_invoke(handle, ndargs, keys, vals, out, is_np_op, output_is_list):
+    """ctypes implementation of imperative invoke wrapper"""
+    if out is not None:
+        original_output = out
+        if isinstance(out, NDArrayBase):
+            out = (out,)
+        num_output = ctypes.c_int(len(out))
+        output_vars = c_handle_array(out)
+        output_vars = ctypes.cast(output_vars, ctypes.POINTER(NDArrayHandle))
+    else:
+        original_output = None
+        output_vars = ctypes.POINTER(NDArrayHandle)()
+        num_output = ctypes.c_int(0)
 
-    check_call(_LIB.MXSymbolGetAtomicSymbolInfo(
-        handle, ctypes.byref(real_name), ctypes.byref(desc),
-        ctypes.byref(num_args),
-        ctypes.byref(arg_names),
-        ctypes.byref(arg_types),
-        ctypes.byref(arg_descs),
-        ctypes.byref(key_var_num_args),
-        ctypes.byref(ret_type)))
-    narg = int(num_args.value)
-    func_name = name
-    key_var_num_args = py_str(key_var_num_args.value)
-    ret_type = py_str(ret_type.value) if ret_type.value is not None else ''
-    doc_str = _build_doc(func_name,
-                         py_str(desc.value),
-                         [py_str(arg_names[i]) for i in range(narg)],
-                         [py_str(arg_types[i]) for i in range(narg)],
-                         [py_str(arg_descs[i]) for i in range(narg)],
-                         key_var_num_args,
-                         ret_type)
-    arguments = []
-    for i in range(num_args.value):
-        dtype = py_str(arg_types[i])
-        if not (dtype.startswith('NDArray') or dtype.startswith('Symbol')):
-            arguments.append(py_str(arg_names[i]))
+    # return output stypes to avoid the c_api call for checking
+    # a handle's stype in _ndarray_cls
+    out_stypes = ctypes.POINTER(ctypes.c_int)()
 
-    # Definition of internal functions.
-    def generic_ndarray_function(*args, **kwargs):
-        """Invoke this function by passing in parameters
+    check_call(_LIB.MXImperativeInvoke(
+        ctypes.c_void_p(handle),
+        ctypes.c_int(len(ndargs)),
+        c_handle_array(ndargs),
+        ctypes.byref(num_output),
+        ctypes.byref(output_vars),
+        ctypes.c_int(len(keys)),
+        c_str_array(keys),
+        c_str_array([str(s) for s in vals]),
+        ctypes.byref(out_stypes)))
 
-        Parameters
-        ----------
-        *args
-            Positional arguments of input scalars and NDArray
-        out : NDArray or tuple of NDArray, optional
-            Output NDArray, used to hold the output result.
+    create_ndarray_fn = _global_var._np_ndarray_cls if is_np_op else _global_var._ndarray_cls
+    if original_output is not None:
+        return original_output
+    if num_output.value == 1 and not output_is_list:
+        return create_ndarray_fn(ctypes.cast(output_vars[0], NDArrayHandle),
+                                 stype=out_stypes[0])
+    else:
+        return [create_ndarray_fn(ctypes.cast(output_vars[i], NDArrayHandle),
+                                  stype=out_stypes[i]) for i in range(num_output.value)]
+
+
+class CachedOp(object):
+    """Cached operator handle."""
+    __slots__ = ["handle", "is_np_sym", "_monitor_callback"]
+
+    def __init__(self, sym, flags=(), thread_safe=False):
+        self.handle = CachedOpHandle()
+        self._monitor_callback = None
+
+        from ..symbol.numpy._symbol import _Symbol
+        self.is_np_sym = bool(isinstance(sym, _Symbol))
+
+        check_call(_LIB.MXCreateCachedOp(
+            sym.handle,
+            len(flags),
+            c_str_array([key for key, _ in flags]),
+            c_str_array([str(val) for _, val in flags]),
+            ctypes.byref(self.handle),
+            ctypes.c_bool(thread_safe)))
+
+    def __del__(self):
+        check_call(_LIB.MXFreeCachedOp(self.handle))
+
+    def get_optimized_symbol(self):
+        """Get an optimized version of the symbol from the cached op.
 
         Returns
         -------
-        out : NDArray
-            The result NDArray(tuple) of result of computation.
+        symbol : Symbol
+            Optimized symbol from the executor.
         """
-        ndargs = []
-        pos_args = []
-        for i in args:
-            if isinstance(i, NDArrayBase):
-                ndargs.append(i)
-            else:
-                pos_args.append(str(i))
+        from ..symbol import Symbol
+        sym_handle = SymbolHandle()
+        check_call(_LIB.MXCachedOpGetOptimizedSymbol(self.handle, ctypes.byref(sym_handle)))
+        ret = Symbol(sym_handle)
+        return ret
 
-        if len(pos_args) > len(arguments):
-            raise ValueError("Too many positional arguments")
-        kwargs.update(zip(arguments[:len(pos_args)], pos_args))
-        if 'dtype' in kwargs:
-            kwargs['dtype'] = np.dtype(kwargs['dtype']).name
-
-        original_output = None
-        if 'out' in kwargs:
-            output_vars = kwargs['out']
-            original_output = output_vars
-            del kwargs['out']
-            if isinstance(output_vars, NDArrayBase):
-                output_vars = (output_vars,)
-            num_output = ctypes.c_int(len(output_vars))
-            output_vars = c_array(NDArrayHandle, [v.handle for v in output_vars])
+    def __call__(self, *args, **kwargs):
+        """ctypes implementation of imperative invoke wrapper"""
+        out = kwargs.pop('out', None)
+        default_ctx = kwargs.pop('default_ctx', None)
+        if out is not None:
+            original_output = out
+            if isinstance(out, NDArrayBase):
+                out = (out,)
+            num_output = ctypes.c_int(len(out))
+            output_vars = c_handle_array(out)
             output_vars = ctypes.cast(output_vars, ctypes.POINTER(NDArrayHandle))
         else:
+            original_output = None
             output_vars = ctypes.POINTER(NDArrayHandle)()
             num_output = ctypes.c_int(0)
+        if kwargs:
+            raise TypeError(
+                "CachedOp.__call__ got unexpected keyword argument(s): " + \
+                ', '.join(kwargs.keys()))
 
-        check_call(_LIB.MXImperativeInvoke(
-            handle,
-            ctypes.c_int(len(ndargs)),
-            c_array(NDArrayHandle, [i.handle for i in ndargs]),
+        # return output stypes to avoid the c_api call for checking
+        # a handle's stype in _ndarray_cls
+        out_stypes = ctypes.POINTER(ctypes.c_int)()
+
+        # (None, ) -> []
+        if len(args) == 1 and args[0] is None:
+            args = []
+            assert default_ctx is not None, 'default_ctx is required if no input is provided'
+        else:
+            default_ctx = args[0].ctx if default_ctx is None else default_ctx
+
+        check_call(_LIB.MXInvokeCachedOp(
+            self.handle,
+            ctypes.c_int(len(args)),
+            c_handle_array(args),
+            ctypes.c_int(default_ctx.device_typeid),
+            ctypes.c_int(default_ctx.device_id),
             ctypes.byref(num_output),
             ctypes.byref(output_vars),
-            ctypes.c_int(len(kwargs)),
-            c_array(ctypes.c_char_p, [c_str(key) for key in kwargs.keys()]),
-            c_array(ctypes.c_char_p, [c_str(str(i)) for i in kwargs.values()])))
+            ctypes.byref(out_stypes)))
+
         if original_output is not None:
             return original_output
+        create_ndarray_fn = _global_var._np_ndarray_cls if self.is_np_sym else _global_var._ndarray_cls
         if num_output.value == 1:
-            return _ndarray_cls(ctypes.cast(output_vars[0], NDArrayHandle))
+            return create_ndarray_fn(ctypes.cast(output_vars[0], NDArrayHandle),
+                                     stype=out_stypes[0])
         else:
-            return [_ndarray_cls(ctypes.cast(output_vars[i], NDArrayHandle))
-                    for i in range(num_output.value)]
-    # End of function declaration
-    generic_ndarray_function.__name__ = func_name
-    generic_ndarray_function.__doc__ = doc_str
-    generic_ndarray_function.__module__ = 'mxnet.ndarray'
-    return generic_ndarray_function
+            return [create_ndarray_fn(ctypes.cast(output_vars[i], NDArrayHandle),
+                                      stype=out_stypes[i]) for i in range(num_output.value)]
 
+    def _register_op_hook(self, callback, monitor_all=False):
+        """Install callback for monitor.
 
-def _set_ndarray_class(cls):
-    """Set the symbolic class to be cls"""
-    global _ndarray_cls
-    _ndarray_cls = cls
-
-
-# pylint: enable=too-many-locals, invalid-name
-def _init_ndarray_module(ndarray_class, root_namespace):
-    """List and add all the ndarray functions to current module."""
-    _set_ndarray_class(ndarray_class)
-    plist = ctypes.POINTER(ctypes.c_char_p)()
-    size = ctypes.c_uint()
-
-    check_call(_LIB.MXListAllOpNames(ctypes.byref(size),
-                                     ctypes.byref(plist)))
-    op_names = []
-    for i in range(size.value):
-        op_names.append(py_str(plist[i]))
-
-    module_obj = _sys.modules["%s.ndarray" % root_namespace]
-    module_internal = _sys.modules["%s._ndarray_internal" % root_namespace]
-    for name in op_names:
-        hdl = OpHandle()
-        check_call(_LIB.NNGetOpHandle(c_str(name), ctypes.byref(hdl)))
-        function = _make_ndarray_function(hdl, name)
-        if function.__name__.startswith('_'):
-            setattr(module_internal, function.__name__, function)
-        else:
-            setattr(module_obj, function.__name__, function)
+        Parameters
+        ----------
+        callback : function
+            Takes a string for node_name, string for op_name and a NDArrayHandle.
+        monitor_all : bool, default False
+            If true, monitor both input _imperative_invoked output, otherwise monitor output only.
+        """
+        cb_type = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_char_p, NDArrayHandle, ctypes.c_void_p)
+        if callback:
+            self._monitor_callback = cb_type(_monitor_callback_wrapper(callback))
+        check_call(_LIB.MXCachedOpRegisterOpHook(
+            self.handle,
+            self._monitor_callback,
+            ctypes.c_int(monitor_all)))

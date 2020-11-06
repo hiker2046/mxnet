@@ -1,3 +1,22 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 /*!
  *  Copyright (c) 2015 by Contributors
  * \file iter_prefetcher.h
@@ -20,38 +39,15 @@
 #include <queue>
 #include <algorithm>
 #include "./inst_vector.h"
+#include "./image_iter_common.h"
 
 namespace mxnet {
 namespace io {
-// Define prefetcher parameters
-struct PrefetcherParam : public dmlc::Parameter<PrefetcherParam> {
-  /*! \brief number of prefetched batches */
-  size_t prefetch_buffer;
-  /*! \brief data type */
-  dmlc::optional<int> dtype;
-
-  // declare parameters
-  DMLC_DECLARE_PARAMETER(PrefetcherParam) {
-    DMLC_DECLARE_FIELD(prefetch_buffer).set_default(4)
-        .describe("Backend Param: Number of prefetched parameters");
-    DMLC_DECLARE_FIELD(dtype)
-      .add_enum("float32", mshadow::kFloat32)
-      .add_enum("float64", mshadow::kFloat64)
-      .add_enum("float16", mshadow::kFloat16)
-      .add_enum("int32", mshadow::kInt32)
-      .add_enum("uint8", mshadow::kUint8)
-      .set_default(dmlc::optional<int>())
-      .describe("Output data type. Leave as None to use"
-                "internal data iterator's output type");
-  }
-};
-
 // iterator on image recordio
 class PrefetcherIter : public IIterator<DataBatch> {
  public:
   explicit PrefetcherIter(IIterator<TBlobBatch>* base)
-      : loader_(base), out_(nullptr) {
-  }
+      : loader_(base), out_(nullptr), length_hint_(-1) {}
 
   ~PrefetcherIter() {
     while (recycle_queue_.size() != 0) {
@@ -60,21 +56,26 @@ class PrefetcherIter : public IIterator<DataBatch> {
       delete batch;
     }
     delete out_;
-    iter_.Destroy();
+    iter.Destroy();
   }
 
-  virtual void Init(const std::vector<std::pair<std::string, std::string> >& kwargs) {
+  void InitParams(const std::vector<std::pair<std::string, std::string> >& kwargs) {
     std::vector<std::pair<std::string, std::string> > kwargs_left;
     // init image rec param
     kwargs_left = param_.InitAllowUnknown(kwargs);
-    // use the kwarg to init batch loader
-    loader_->Init(kwargs);
+    CHECK_GT(param_.prefetch_buffer, 0) << "Prefetch_buffer must be positive number";
     // maximum prefetch threaded iter internal size
     const int kMaxPrefetchBuffer = 16;
     // init thread iter
-    iter_.set_max_capacity(kMaxPrefetchBuffer);
+    iter.set_max_capacity(kMaxPrefetchBuffer);
+  }
 
-    iter_.Init([this](DataBatch **dptr) {
+  virtual void Init(const std::vector<std::pair<std::string, std::string> >& kwargs) {
+    InitParams(kwargs);
+    // use the kwarg to init batch loader
+    loader_->Init(kwargs);
+    length_hint_ = loader_->GetLenHint();
+    iter.Init([this](DataBatch **dptr) {
         if (!loader_->Next()) return false;
         const TBlobBatch& batch = loader_->Value();
         if (*dptr == nullptr) {
@@ -87,14 +88,20 @@ class PrefetcherIter : public IIterator<DataBatch> {
             auto dtype = param_.dtype
                              ? param_.dtype.value()
                              : batch.data[i].type_flag_;
+            auto ctx = ((param_.ctx == PrefetcherParam::kCPUPinned) && (param_.device_id >= 0)) ?
+              Context::CPUPinned(param_.device_id) : Context::CPU();
             (*dptr)->data.at(i) = NDArray(batch.data[i].shape_,
-                                          Context::CPU(), false,
+                                          ctx, false,
                                           dtype);
           }
         }
         CHECK(batch.data.size() == (*dptr)->data.size());
         // copy data over
         for (size_t i = 0; i < batch.data.size(); ++i) {
+          if ((*dptr)->data.at(i).shape() != batch.data[i].shape_) {
+            // TODO(zhreshold): memory pool for dynamic shaped data
+            (*dptr)->data.at(i).ReshapeAndAlloc(batch.data[i].shape_);
+          }
           CHECK_EQ((*dptr)->data.at(i).shape(), batch.data[i].shape_);
           MSHADOW_TYPE_SWITCH(batch.data[i].type_flag_, DType, {
               mshadow::Copy(((*dptr)->data)[i].data().FlatTo2D<cpu, DType>(),
@@ -109,11 +116,15 @@ class PrefetcherIter : public IIterator<DataBatch> {
         }
        return true;
       },
-      [this]() { loader_->BeforeFirst(); });
+      [this]() { loader_->BeforeFirst(); length_hint_ = loader_->GetLenHint();});
   }
 
   virtual void BeforeFirst(void) {
-    iter_.BeforeFirst();
+    iter.BeforeFirst();
+  }
+
+  virtual int64_t GetLenHint(void) const {
+    return length_hint_;
   }
 
   virtual bool Next(void) {
@@ -128,9 +139,9 @@ class PrefetcherIter : public IIterator<DataBatch> {
         arr.WaitToWrite();
       }
       recycle_queue_.pop();
-      iter_.Recycle(&old_batch);
+      iter.Recycle(&old_batch);
     }
-    return iter_.Next(&out_);
+    return iter.Next(&out_);
   }
   virtual const DataBatch &Value(void) const {
     return *out_;
@@ -139,6 +150,8 @@ class PrefetcherIter : public IIterator<DataBatch> {
  protected:
   /*! \brief prefetcher parameters */
   PrefetcherParam param_;
+  /*! \brief backend thread */
+  dmlc::ThreadedIter<DataBatch> iter;
   /*! \brief internal batch loader */
   std::unique_ptr<IIterator<TBlobBatch> > loader_;
 
@@ -147,8 +160,8 @@ class PrefetcherIter : public IIterator<DataBatch> {
   DataBatch *out_;
   /*! \brief queue to be recycled */
   std::queue<DataBatch*> recycle_queue_;
-  /*! \brief backend thread */
-  dmlc::ThreadedIter<DataBatch> iter_;
+  /*! \brief size hint cache */
+  int64_t length_hint_;
 };
 }  // namespace io
 }  // namespace mxnet

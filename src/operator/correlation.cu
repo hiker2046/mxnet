@@ -1,3 +1,22 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 /*!
  * Copyright [2016] <Contributors>
  * \file Correation.cu
@@ -9,6 +28,7 @@
 #include <mshadow/cuda/reduce.cuh>
 #include <algorithm>
 #include <vector>
+#include "./mxnet_op.h"
 
 #define ROUND_OFF 50000
 #define WARPS_PER_BLOCK 1
@@ -19,10 +39,7 @@
     cudaError_t error = condition; \
     CHECK_EQ(error, cudaSuccess) << " " << cudaGetErrorString(error); \
   } while (0)
-#define CUDA_KERNEL_LOOP(i, n) \
-for (int i = blockIdx.x * blockDim.x + threadIdx.x; \
-      i < (n); \
-      i += blockDim.x * gridDim.x)
+
 namespace mshadow {
 namespace cuda {
 // == Correlation Kernel
@@ -459,7 +476,7 @@ void Forward_gpu(
             stride1_, stride2_,
             width, height, channels,
             rbot1, rbot2, top);
-        CORRELATION_CUDA_CHECK(cudaPeekAtLastError());
+        CORRELATION_CUDA_CHECK(cudaGetLastError());
     } else {
         //  CorrelationLayer
         for (int n = 0; n < num; n++) {
@@ -472,7 +489,7 @@ void Forward_gpu(
                 max_displacement_, neighborhood_grid_radius_,
                 neighborhood_grid_width_, kernel_radius_,
                 stride1_, stride2_, width, height, channels, rbot1, rbot2, top);
-         CORRELATION_CUDA_CHECK(cudaPeekAtLastError());
+         CORRELATION_CUDA_CHECK(cudaGetLastError());
         }
     }
 }
@@ -517,7 +534,7 @@ void Backward_gpu(
             stride1_, stride2_,
             width, height, paddedwidth, paddedheight, channels, bottomcount, pad_size_,
             bottom0_diff, rbot2, top_diff);
-        CORRELATION_CUDA_CHECK(cudaPeekAtLastError());
+        CORRELATION_CUDA_CHECK(cudaGetLastError());
         }
         //  == Run kernel Backward 1
         for (int n = 0; n < num; n++) {
@@ -528,7 +545,7 @@ void Backward_gpu(
             stride1_, stride2_,
             width, height, paddedwidth, paddedheight, channels, bottomcount, pad_size_,
             rbot1, bottom1_diff, top_diff);
-       CORRELATION_CUDA_CHECK(cudaPeekAtLastError());
+       CORRELATION_CUDA_CHECK(cudaGetLastError());
         }
     } else  {
         for (int n = 0; n < num; n++) {
@@ -540,7 +557,7 @@ void Backward_gpu(
             stride1_, stride2_,
             width, height, paddedwidth, paddedheight, channels, bottomcount, pad_size_,
             bottom0_diff, rbot1, rbot2, top_diff);
-        CORRELATION_CUDA_CHECK(cudaPeekAtLastError());
+        CORRELATION_CUDA_CHECK(cudaGetLastError());
         }
         for (int n = 0; n < num; n++) {
         //  Bottom1:
@@ -551,7 +568,7 @@ void Backward_gpu(
             stride1_, stride2_,
             width, height, paddedwidth, paddedheight, channels, bottomcount, pad_size_,
             rbot1, rbot2, bottom1_diff, top_diff);
-        CORRELATION_CUDA_CHECK(cudaPeekAtLastError());
+        CORRELATION_CUDA_CHECK(cudaGetLastError());
         }
     }
 }
@@ -602,8 +619,12 @@ inline void CorrelationBackward(const Tensor<gpu, 4, Dtype> &out_grad,
 namespace mxnet {
 namespace op {
 template<>
-Operator* CreateOp<gpu>(CorrelationParam param) {
-  return new CorrelationOp<gpu>(param);
+Operator* CreateOp<gpu>(CorrelationParam param, int dtype) {
+  Operator* op = nullptr;
+  MSHADOW_REAL_TYPE_SWITCH(dtype, DType, {
+    op = new CorrelationOp<gpu, DType>(param);
+  });
+  return op;
 }
 }  // namespace op
 }  // namespace mxnet
